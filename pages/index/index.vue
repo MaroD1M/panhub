@@ -203,7 +203,6 @@ const {
   pauseSearch,
   continueSearch,
   hasResults,
-  merged
 } = useSearch();
 const { settings } = useSettings();
 
