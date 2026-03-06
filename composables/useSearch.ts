@@ -420,7 +420,10 @@ export function useSearch() {
         )
       );
 
-      // 2) 深度搜索
+      // 快速搜索完成，立即关闭 loading，让用户看到结果
+      setLoading(false);
+
+      // 2) 深度搜索（后台进行，用 deepLoading 表示）
       setDeepLoading(true);
       await performDeepSearch(options, mySeq);
       // 如果暂停了，停止后续操作
@@ -429,10 +432,8 @@ export function useSearch() {
       setError(error?.data?.message || error?.message || "请求失败");
     } finally {
       setElapsedMs(Math.round(performance.now() - start));
-      // 如果暂停了，保持 loading 状态，只取消 deepLoading
-      if (!state.value.paused) {
-        setLoading(false);
-      }
+      // 深度搜索完成，关闭 deepLoading
+      // 注意：loading 已经在快速搜索完成后关闭，这里不需要再处理
       setDeepLoading(false);
     }
   }
