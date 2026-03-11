@@ -12,35 +12,78 @@ export async function fetchTgChannelPosts(
   keyword: string,
   options: TgFetchOptions = {}
 ): Promise<SearchResult[]> {
-  const url = `https://t.me/s/${encodeURIComponent(channel)}`;
   const ua =
     options.userAgent ||
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
-  let html = "";
-  try {
-    html = await ofetch<string>(url, { headers: { "user-agent": ua } });
-  } catch (e) {
-    // ignore, try fallback below
-  }
-  // 如果直连失败或页面不包含目标结构，尝试使用只读代理镜像（无跨域、仅返回渲染后的 HTML 文本）
-  if (!html || !html.includes("tgme_widget_message")) {
-    const mirrors = [
-      `https://r.jina.ai/http://t.me/s/${encodeURIComponent(channel)}`,
-      `https://r.jina.ai/https://t.me/s/${encodeURIComponent(channel)}`,
-      `https://r.jina.ai/http://t.me/${encodeURIComponent(channel)}`,
-      `https://r.jina.ai/https://t.me/${encodeURIComponent(channel)}`,
-    ];
-    for (const m of mirrors) {
+
+  const limit = options.limitPerChannel ?? 50;
+  const maxPages = Math.ceil(limit / 20); // 每页约20条消息
+  const allResults: SearchResult[] = [];
+  let before: string | undefined = undefined;
+
+  // 多页加载，直到达到限制或没有更多消息
+  for (let page = 0; page < maxPages && allResults.length < limit; page++) {
+    const baseUrl = `https://t.me/s/${encodeURIComponent(channel)}`;
+    const url = before ? `${baseUrl}?before=${before}` : baseUrl;
+
+    let html = "";
+    try {
+      html = await ofetch<string>(url, { headers: { "user-agent": ua } });
+    } catch (e) {
+      // ignore, try fallback below
+    }
+
+    // 如果直连失败或页面不包含目标结构，尝试使用只读代理镜像
+    if (!html || !html.includes("tgme_widget_message")) {
+      const mirrorUrl = before
+        ? `https://r.jina.ai/https://t.me/s/${encodeURIComponent(channel)}?before=${before}`
+        : `https://r.jina.ai/https://t.me/s/${encodeURIComponent(channel)}`;
+
       try {
-        html = await ofetch<string>(m, { headers: { "user-agent": ua } });
-        if (html && html.includes("tgme_widget_message")) break;
+        html = await ofetch<string>(mirrorUrl, { headers: { "user-agent": ua } });
       } catch {}
     }
-  }
-  const $ = load(html || "");
 
+    if (!html || !html.includes("tgme_widget_message")) {
+      break; // 无法获取更多消息
+    }
+
+    // 解析当前页的消息
+    const $ = load(html || "");
+    const pageResults = parseChannelPage($, channel, keyword, limit - allResults.length);
+    allResults.push(...pageResults);
+
+    // 获取下一页的 before 参数
+    const nextLink = $('a[href*="before="]').first();
+    const href = nextLink.attr("href");
+    if (href) {
+      const match = href.match(/before=([^&]+)/);
+      if (match) {
+        before = match[1];
+      } else {
+        break; // 没有更多页面
+      }
+    } else {
+      break; // 没有下一页链接
+    }
+
+    // 避免请求过快
+    if (page < maxPages - 1 && allResults.length < limit) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  return allResults;
+}
+
+// 解析单个频道页面的消息
+function parseChannelPage(
+  $: cheerio.CheerioAPI,
+  channel: string,
+  keyword: string,
+  limit: number
+): SearchResult[] {
   const results: SearchResult[] = [];
-  const limit = options.limitPerChannel ?? 50;
   const kw = keyword.trim().toLowerCase();
 
   const deproxyUrl = (raw: string): string => {
@@ -95,13 +138,18 @@ export async function fetchTgChannelPosts(
     const dateTitle = root.find("time").attr("datetime") || "";
     const postId = root.find(".tgme_widget_message").attr("data-post") || "";
 
-    // 提取第一行
+    // 提取第一行（用于标题显示）
     const firstLine = text.split("\n")[0] || text.slice(0, 80);
 
-    // 关键词过滤（包含即可）
+    // 关键词过滤：搜索整个消息文本
     if (kw && kw.length > 0) {
-      const hay = (firstLine + " " + text).toLowerCase();
-      if (!hay.includes(kw)) return;
+      const hay = text.toLowerCase();
+      const keyword = kw.toLowerCase();
+
+      // 直接包含匹配
+      if (!hay.includes(keyword)) {
+        return; // 不匹配，跳过
+      }
     }
 
     // 简单提取常见网盘链接（包括文本与 a[href]）
@@ -140,18 +188,20 @@ export async function fetchTgChannelPosts(
       if (href) addUrl(href);
     });
 
-    // 生成 title：移除 URL，保留其他文本
+    // 生成 title：移除 URL 和标签，保留核心内容
     let title = firstLine;
     for (const link of links) {
       const escaped = link.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       title = title.replace(new RegExp(escaped, "g"), "");
     }
-    // 移除常见的分隔符和平台名称（但保留其他内容）
+    // 移除常见标签和分隔符
     title = title
-      .replace(/(夸克|UC|百度|阿里|迅雷|115|天翼|123|移动|提取码|密码|：|:|，|,|。|\.|、|\||-)+/g, "")
+      .replace(/(名称|描述|链接|大小|标签|夸克|UC|百度|阿里|迅雷|115|天翼|123|移动|提取码|密码|📁|🏷|：|:|，|,|。|\.|、|\||-|\s)+/g, " ")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 80);
+    // 如果清理后为空，使用原始第一行
+    if (!title) title = firstLine.slice(0, 80);
     // 如果清理后为空，使用原始第一行
     if (!title) title = firstLine.slice(0, 80);
 
