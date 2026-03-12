@@ -1,15 +1,17 @@
 import pLimit from "p-limit";
 import { UnifiedCache, CacheNamespace } from "../cache/unifiedCache";
-import { safeExecute, fetchWithRetry } from "../utils/fetch";
-import type {
-  MergedLinks,
-  SearchRequest,
-  SearchResponse,
-  SearchResult,
-} from "../types/models";
+import { safeExecute } from "../utils/fetch";
+import type { MergedLinks, SearchResponse, SearchResult } from "../types/models";
 import { PluginManager, type AsyncSearchPlugin } from "../plugins/manager";
-import { PluginHealthChecker, createPluginHealthChecker } from "../plugins/pluginHealth";
-import { ErrorCollector, classifyError, ErrorType } from "../utils/errors";
+import {
+  PluginHealthChecker,
+  createPluginHealthChecker,
+} from "../plugins/pluginHealth";
+import {
+  ErrorCollector,
+  classifyError,
+  type WarningInfo,
+} from "../utils/errors";
 
 export interface SearchServiceOptions {
   priorityChannels: string[];
@@ -24,7 +26,6 @@ export class SearchService {
   private options: SearchServiceOptions;
   private pluginManager: PluginManager;
   private cache: UnifiedCache;
-  private errorCollector: ErrorCollector;
   private healthChecker: PluginHealthChecker;
 
   constructor(options: SearchServiceOptions, pluginManager: PluginManager) {
@@ -39,7 +40,6 @@ export class SearchService {
     );
 
     this.healthChecker = createPluginHealthChecker();
-    this.errorCollector = new ErrorCollector();
   }
 
   getPluginManager() {
@@ -57,8 +57,33 @@ export class SearchService {
     cloudTypes: string[] | undefined,
     ext: Record<string, any> | undefined
   ): Promise<SearchResponse> {
-    // 日志已精简：只在搜索完成时打印结果，避免重复打印用户搜索词
+    const { response } = await this.searchWithWarnings(
+      keyword,
+      channels,
+      concurrency,
+      forceRefresh,
+      resultType,
+      sourceType,
+      plugins,
+      cloudTypes,
+      ext
+    );
 
+    return response;
+  }
+
+  async searchWithWarnings(
+    keyword: string,
+    channels: string[] | undefined,
+    concurrency: number | undefined,
+    forceRefresh: boolean | undefined,
+    resultType: string | undefined,
+    sourceType: "all" | "tg" | "plugin" | undefined,
+    plugins: string[] | undefined,
+    cloudTypes: string[] | undefined,
+    ext: Record<string, any> | undefined
+  ): Promise<{ response: SearchResponse; warnings: WarningInfo[] }> {
+    const errorCollector = new ErrorCollector();
     const effChannels =
       channels && channels.length > 0 ? channels : this.options.defaultChannels;
     const effConcurrency =
@@ -96,7 +121,8 @@ export class SearchService {
           plugins,
           !!forceRefresh,
           effConcurrency,
-          ext ?? {}
+          ext ?? {},
+          errorCollector
         );
       });
     }
@@ -112,8 +138,9 @@ export class SearchService {
       const hasLinks = Array.isArray(r.links) && r.links.length > 0;
       const keywordPriority = this.getKeywordPriority(r.title);
       const pluginLevel = this.getPluginLevelBySource(this.getResultSource(r));
-      if (hasTime || hasLinks || keywordPriority > 0 || pluginLevel <= 2)
+      if (hasTime || hasLinks || keywordPriority > 0 || pluginLevel <= 2) {
         filteredForResults.push(r);
+      }
     }
 
     const mergedLinks = this.mergeResultsByType(
@@ -134,7 +161,6 @@ export class SearchService {
       total = filteredForResults.length;
       response = { total, results: filteredForResults };
     } else {
-      // all
       total = filteredForResults.length;
       response = {
         total,
@@ -143,7 +169,10 @@ export class SearchService {
       };
     }
 
-    return response;
+    return {
+      response,
+      warnings: errorCollector.getWarnings(),
+    };
   }
 
   private async searchTG(
@@ -155,9 +184,8 @@ export class SearchService {
   ): Promise<SearchResult[]> {
     const chList = Array.isArray(channels) ? channels : [];
     const cacheKey = `tg:${keyword}:${[...chList].sort().join(",")}`;
-    const { cacheEnabled, cacheTtlMinutes, priorityChannels } = this.options;
+    const { cacheEnabled, priorityChannels } = this.options;
 
-    // 缓存检查
     if (!forceRefresh && cacheEnabled) {
       const cached = this.cache.get(CacheNamespace.TG_SEARCH, cacheKey);
       if (cached.hit && cached.value) {
@@ -165,7 +193,6 @@ export class SearchService {
       }
     }
 
-    // 获取配置
     const { fetchTgChannelPosts } = await import("./tg");
     const perChannelLimit = 30;
     const requestedTimeout = Number((ext as any)?.__plugin_timeout_ms) || 0;
@@ -180,12 +207,10 @@ export class SearchService {
       Math.min(concurrencyOverride ?? this.options.defaultConcurrency, 12)
     );
 
-    // 分批策略：优先频道 + 普通频道
     const prioritySet = new Set(priorityChannels || []);
     const priorityList = chList.filter((ch) => prioritySet.has(ch));
     const normalList = chList.filter((ch) => !prioritySet.has(ch));
 
-    // 辅助函数：创建频道搜索任务
     const createChannelTask = (channel: string) => async () => {
       const result = await safeExecute(
         () =>
@@ -201,11 +226,9 @@ export class SearchService {
       return result;
     };
 
-    // 所有任务并发执行（优先频道和普通频道并行）
     const allTasks = [...priorityList, ...normalList].map(createChannelTask);
     const allResults = await this.runWithConcurrency(allTasks, concurrency);
 
-    // 合并结果
     const results: SearchResult[] = [];
     for (const arr of allResults) {
       if (Array.isArray(arr)) {
@@ -213,7 +236,6 @@ export class SearchService {
       }
     }
 
-    // 缓存结果
     if (cacheEnabled && results.length > 0) {
       this.cache.set(CacheNamespace.TG_SEARCH, cacheKey, results);
     }
@@ -226,14 +248,15 @@ export class SearchService {
     plugins: string[] | undefined,
     forceRefresh: boolean,
     concurrency: number,
-    ext: Record<string, any>
+    ext: Record<string, any>,
+    errorCollector: ErrorCollector
   ): Promise<SearchResult[]> {
     const cacheKey = `plugin:${keyword}:${(plugins ?? [])
       .map((p) => p?.toLowerCase())
       .filter(Boolean)
       .sort()
       .join(",")}`;
-    const { cacheEnabled, cacheTtlMinutes } = this.options;
+    const { cacheEnabled } = this.options;
 
     if (!forceRefresh && cacheEnabled) {
       const cached = this.cache.get(CacheNamespace.PLUGIN_SEARCH, cacheKey);
@@ -243,16 +266,16 @@ export class SearchService {
     }
 
     const allPlugins = this.pluginManager.getPlugins();
-    
-    // 过滤掉不健康的插件（熔断器开启的插件）
-    const healthyPlugins = allPlugins.filter((p) => 
+    const healthyPlugins = allPlugins.filter((p) =>
       this.healthChecker.isHealthy(p.name())
     );
-    
+
     let available: AsyncSearchPlugin[] = [];
     if (plugins && plugins.length > 0 && plugins.some((p) => !!p)) {
       const wanted = new Set(plugins.map((p) => p.toLowerCase()));
-      available = healthyPlugins.filter((p) => wanted.has(p.name().toLowerCase()));
+      available = healthyPlugins.filter((p) =>
+        wanted.has(p.name().toLowerCase())
+      );
     } else {
       available = healthyPlugins;
     }
@@ -265,7 +288,6 @@ export class SearchService {
         : this.options.pluginTimeoutMs || 0
     );
 
-    // 使用 safeExecuteAll 统一处理错误，避免单个插件失败影响整体
     const pluginPromises = available.map((p) => async () => {
       p.setMainCacheKey(cacheKey);
       p.setCurrentKeyword(keyword);
@@ -273,27 +295,20 @@ export class SearchService {
       const startTime = Date.now();
       const pluginName = p.name();
 
-      // 主搜索
       let results = await this.withTimeout<SearchResult[]>(
         p.search(keyword, ext),
         timeoutMs,
         []
       );
 
-      // 记录健康状态
       const responseTime = Date.now() - startTime;
       if (results && results.length > 0) {
         this.healthChecker.recordSuccess(pluginName, responseTime);
       } else {
-        // 超时或无结果记录为失败
         this.healthChecker.recordFailure(pluginName);
       }
 
-      // 短关键词兜底逻辑
-      if (
-        (!results || results.length === 0) &&
-        (keyword || "").trim().length <= 1
-      ) {
+      if ((!results || results.length === 0) && (keyword || "").trim().length <= 1) {
         const fallbacks = ["电影", "movie", "1080p"];
         for (const fb of fallbacks) {
           const fallbackResults = await this.withTimeout<SearchResult[]>(
@@ -311,18 +326,15 @@ export class SearchService {
       return results || [];
     });
 
-    // 使用并发控制执行，同时利用 safeExecuteAll 提供统一错误处理
     const resultsByPlugin = await this.runWithConcurrency(
       pluginPromises.map((promiseFactory) => async () => {
         try {
-      const result = await promiseFactory();
-      return result;
-    } catch (error) {
-      // 记录错误
-      const errorDetail = classifyError(error, "plugin_search");
-      this.errorCollector.record(errorDetail);
-      return [];
-    }
+          return await promiseFactory();
+        } catch (error) {
+          const errorDetail = classifyError(error, "plugin_search");
+          errorCollector.record(errorDetail);
+          return [];
+        }
       }),
       concurrency
     );
@@ -381,13 +393,13 @@ export class SearchService {
   }
 
   private getResultSource(_r: SearchResult): string {
-    // 可根据 SearchResult 增补来源字段，这里返回空表示未知
     return "";
   }
 
   private getPluginLevelBySource(_source: string): number {
     return 3;
   }
+
   private getKeywordPriority(_title: string): number {
     return 0;
   }
@@ -442,14 +454,6 @@ export class SearchService {
 
   getPluginHealthStatus() {
     return this.healthChecker.getAllStatus();
-  }
-
-  getWarnings() {
-    return this.errorCollector.getWarnings();
-  }
-
-  clearErrors(source?: string) {
-    this.errorCollector.clear(source);
   }
 
   resetPluginHealth(pluginName?: string) {

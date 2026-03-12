@@ -6,6 +6,12 @@
 import { ofetch } from "ofetch";
 import type { $Fetch } from "ofetch";
 
+function normalizeError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === "string") return new Error(error);
+  return new Error("Unknown error");
+}
+
 export interface FetchWithRetryOptions {
   /** 最大重试次数，默认 3 */
   maxRetries?: number;
@@ -111,11 +117,12 @@ export async function fetchWithRetry<T = any>(
 export async function safeExecute<T>(
   operation: () => Promise<T>,
   fallback: T,
-  _errorLogger?: ReturnType<typeof createLogger>
+  errorLogger?: { error?: (message: string, error: Error) => void }
 ): Promise<T> {
   try {
     return await operation();
-  } catch (_error) {
+  } catch (error) {
+    errorLogger?.error?.("Operation failed", normalizeError(error));
     return fallback;
   }
 }
@@ -139,9 +146,9 @@ export async function safeExecute<T>(
 export async function safeExecuteAll<T>(
   operations: Array<() => Promise<T>>,
   fallback: T,
-  _logger?: ReturnType<typeof createLogger>
+  logger?: { error?: (message: string, error: Error) => void }
 ): Promise<T[]> {
-  const promises = operations.map((op) => safeExecute(op, fallback));
+  const promises = operations.map((op) => safeExecute(op, fallback, logger));
   return Promise.all(promises);
 }
 

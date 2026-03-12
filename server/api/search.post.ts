@@ -17,15 +17,16 @@ export default defineEventHandler(async (event) => {
     );
   }
 
-  // 规范化入参：支持字符串与数组两种形式
   const parseList = (val: any): string[] | undefined => {
-    if (Array.isArray(val))
+    if (Array.isArray(val)) {
       return val.filter((s) => typeof s === "string" && s.trim());
-    if (typeof val === "string")
+    }
+    if (typeof val === "string") {
       return val
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+    }
     return undefined;
   };
 
@@ -38,7 +39,7 @@ export default defineEventHandler(async (event) => {
   if (body.src === "tg") body.plugins = undefined;
   else if (body.src === "plugin") body.channels = undefined;
 
-  const result = await service.search(
+  const { response: result, warnings } = await service.searchWithWarnings(
     kw,
     body.channels,
     body.conc,
@@ -52,8 +53,13 @@ export default defineEventHandler(async (event) => {
 
   const resp: GenericResponse<typeof result> = {
     code: 0,
-    message: "success",
+    message: warnings.length > 0 ? "partial_success" : "success",
     data: result,
   };
+
+  if (warnings.length > 0) {
+    (resp as any).warnings = warnings;
+  }
+
   return resp;
 });

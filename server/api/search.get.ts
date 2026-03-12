@@ -57,12 +57,11 @@ export default defineEventHandler(async (event) => {
     ext,
   };
 
-  // 互斥逻辑
   if (req.src === "tg") req.plugins = undefined;
   else if (req.src === "plugin") req.channels = undefined;
   if (!req.res || req.res === "merge") req.res = "merged_by_type";
 
-  const result = await service.search(
+  const { response: result, warnings } = await service.searchWithWarnings(
     req.kw,
     req.channels,
     req.conc,
@@ -74,16 +73,12 @@ export default defineEventHandler(async (event) => {
     req.ext || {}
   );
 
-  // 获取警告信息
-  const warnings = service.getWarnings();
-
   const resp: GenericResponse<typeof result> = {
     code: 0,
     message: warnings.length > 0 ? "partial_success" : "success",
     data: result,
   };
 
-  // 如果有警告，添加到响应中
   if (warnings.length > 0) {
     (resp as any).warnings = warnings;
   }

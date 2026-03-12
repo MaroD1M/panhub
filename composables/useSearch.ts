@@ -228,13 +228,13 @@ export function useSearch() {
     // 并发执行所有任务，哪个先返回就立即合并展示，不等待其它
     let currentMerged: MergedLinks = {};
 
-    const limitedTasks = searchTasks.map((task) => limit(task));
-    const tasksToRun =
-      startFromTaskIndex > 0 ? limitedTasks.slice(startFromTaskIndex) : limitedTasks;
+    const tasksToSchedule =
+      startFromTaskIndex > 0 ? searchTasks.slice(startFromTaskIndex) : searchTasks;
+    const limitedTasks = tasksToSchedule.map((task) => limit(task));
 
     devLog(
       '[performParallelSearch] 开始执行',
-      tasksToRun.length,
+      limitedTasks.length,
       '个任务',
       startFromTaskIndex > 0 ? `(从第 ${startFromTaskIndex + 1} 个续跑)` : ''
     );
@@ -260,7 +260,7 @@ export function useSearch() {
       parallelCompletedCount = completedCount;
     };
 
-    const wrapped = tasksToRun.map((limitedTask) =>
+    const wrapped = limitedTasks.map((limitedTask) =>
       limitedTask
         .then((result) => {
           processTask(result);
